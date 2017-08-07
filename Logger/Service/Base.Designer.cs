@@ -1,4 +1,4 @@
-﻿namespace LoggerService
+﻿namespace Logger
 {
     partial class Service
     {
@@ -31,6 +31,7 @@
             // 
             // Service
             // 
+            this.CanHandleSessionChangeEvent = true;
             this.CanShutdown = true;
             this.ServiceName = "abcLoggerSvc";
 
